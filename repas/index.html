@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Mon HelloFresh perso</title>
+  <meta name="description" content="Tes repas de la semaine, les courses au meilleur prix entre les drives (promos, lots), et un chef IA à qui tu réponds comme sur WhatsApp.">
+  <meta name="theme-color" content="#0b5d4b">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧑‍🍳</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body data-view="chat">
+  <header class="top">
+    <div class="brand"><span aria-hidden="true">🧑‍🍳</span> Mon HelloFresh <em>perso</em></div>
+    <nav class="tabs" aria-label="Sections">
+      <button data-view="chat" class="only-mobile">Discussion</button>
+      <button data-view="week">Semaine</button>
+      <button data-view="list">Courses</button>
+      <button data-view="profile">Profil</button>
+    </nav>
+  </header>
+
+  <main class="layout">
+    <section class="chat" aria-label="Discussion avec le chef">
+      <div class="wa-head">
+        <div class="avatar" aria-hidden="true">🧑‍🍳</div>
+        <div><strong>Chef</strong><small id="status">en ligne</small></div>
+        <span class="mode" id="mode">mode local</span>
+        <button class="icon" id="share-wa" title="Envoyer le menu sur WhatsApp" aria-label="Envoyer le menu sur WhatsApp">📤</button>
+      </div>
+      <div class="messages" id="messages" aria-live="polite"></div>
+      <div class="bubble bot typing" id="typing" hidden><span></span><span></span><span></span></div>
+      <div class="chips" aria-label="Suggestions">
+        <button data-say="Prépare mes repas de la semaine">🗓️ Ma semaine</button>
+        <button data-say="change mardi">🔄 change mardi</button>
+        <button data-say="on sera 4 jeudi">👥 on sera 4 jeudi</button>
+        <button data-say="pas de poisson">🚫 pas de poisson</button>
+        <button data-say="compare les drives">📊 compare les drives</button>
+        <button data-say="la liste de courses">🛒 la liste</button>
+      </div>
+      <form class="composer" id="composer">
+        <input id="input" autocomplete="off" placeholder="« change mardi, on sera 4 jeudi »" aria-label="Message">
+        <button id="send" class="send" aria-label="Envoyer">➤</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="view view-week">
+        <div class="view-head"><h2>La semaine</h2><button class="btn ghost" data-say="nouvelle semaine">Tout regénérer</button></div>
+        <div id="week" class="week"></div>
+      </div>
+
+      <div class="view view-list">
+        <div class="view-head"><h2>Liste de courses</h2><span class="pill" id="state-pill">Brouillon</span></div>
+        <div id="shopping"></div>
+      </div>
+
+      <div class="view view-profile">
+        <div class="view-head"><h2>Profil du foyer</h2></div>
+        <form id="profile" class="profile" onsubmit="return false">
+          <label>Personnes à la maison<input type="number" name="people" min="1" max="12"></label>
+          <label>Budget courses / semaine (€)<input type="number" name="budget" min="0" step="5"></label>
+          <fieldset><legend>Repas à prévoir</legend>
+            <label class="inline"><input type="checkbox" name="slots" value="midi"> Midi</label>
+            <label class="inline"><input type="checkbox" name="slots" value="soir"> Soir</label>
+          </fieldset>
+          <label>Régime
+            <select name="diet">
+              <option value="omnivore">Je mange de tout</option>
+              <option value="flexi">Flexitarien (moins de viande)</option>
+              <option value="pesco">Pescétarien</option>
+              <option value="vege">Végétarien</option>
+            </select>
+          </label>
+          <label>Temps de préparation max
+            <select name="maxTime">
+              <option value="20">20 min</option><option value="30">30 min</option>
+              <option value="45">45 min</option><option value="90">Peu importe</option>
+            </select>
+          </label>
+          <label>Ce qu'on aime<input name="likes" placeholder="pâtes, curry, mexicain, rapide…"></label>
+          <label>À éviter (virgules)<input name="avoid" placeholder="champignons, poisson…"></label>
+          <fieldset><legend>Drives à comparer</legend>
+            <div id="stores-box" class="stores-box"></div>
+            <label>Nombre de drives max à faire
+              <select name="maxStores">
+                <option value="1">1 seul drive</option>
+                <option value="2">2 drives si ça vaut le coup</option>
+                <option value="3">Jusqu'à 3 drives</option>
+              </select>
+            </label>
+          </fieldset>
+          <label>Mon numéro WhatsApp (optionnel)<input name="phone" inputmode="tel" placeholder="33612345678"></label>
+
+          <fieldset class="ai"><legend>Chef IA (Claude)</legend>
+            <p>Sans clé, le chef comprend les commandes simples et estime les prix. Avec une clé API Anthropic, tu lui parles librement et il peut relever les vrais prix, promos et lots sur les sites des drives.</p>
+            <label>Clé API<input name="apiKey" type="password" autocomplete="off" placeholder="sk-ant-…"></label>
+            <label class="inline"><input type="checkbox" name="livePrices"> Chercher les vrais prix et promos sur les drives (plus lent)</label>
+            <p class="small">La clé reste dans ce navigateur et n'est envoyée qu'à api.anthropic.com.</p>
+          </fieldset>
+          <button type="button" class="btn ghost danger" id="reset">Effacer menu & discussion</button>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <footer class="bar">
+    <div class="sum">
+      <div><strong id="total">0 €</strong> <span id="budget"></span></div>
+      <div class="meter" id="meter"><span></span></div>
+    </div>
+    <button class="btn primary" id="validate" disabled>Valider la liste</button>
+  </footer>
+
+  <dialog id="order">
+    <form method="dialog" class="order">
+      <h2>Remplir les paniers</h2>
+      <p>Un panier par drive, au meilleur prix. Ouvre chaque produit sur le site du drive pour l'ajouter, puis valide le créneau de retrait.</p>
+      <div id="order-list" class="order-list"></div>
+      <p class="order-total">Total : <strong id="order-total"></strong></p>
+      <p class="small">🔌 Prochaine étape : un agent connecté à tes comptes drive qui remplit les paniers tout seul ; tu n'as plus qu'à valider le créneau.</p>
+      <div class="order-actions">
+        <button type="button" class="btn ghost" id="order-copy">Copier</button>
+        <button type="button" class="btn ghost" id="order-wa">WhatsApp</button>
+        <button type="button" class="btn primary" id="order-done">Tout est prêt 🚗</button>
+      </div>
+      <button class="close" aria-label="Fermer">✕</button>
+    </form>
+  </dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
