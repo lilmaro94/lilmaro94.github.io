@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Mon HelloFresh perso</title>
-  <meta name="description" content="Tes repas de la semaine, ta liste de courses aux prix Auchan, et un chef IA à qui tu réponds comme sur WhatsApp.">
+  <meta name="description" content="Tes repas de la semaine, les courses au meilleur prix entre les drives (promos, lots), et un chef IA à qui tu réponds comme sur WhatsApp.">
   <meta name="theme-color" content="#0b5d4b">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧑‍🍳</text></svg>">
   <link rel="stylesheet" href="style.css">
@@ -35,6 +35,7 @@
         <button data-say="change mardi">🔄 change mardi</button>
         <button data-say="on sera 4 jeudi">👥 on sera 4 jeudi</button>
         <button data-say="pas de poisson">🚫 pas de poisson</button>
+        <button data-say="compare les drives">📊 compare les drives</button>
         <button data-say="la liste de courses">🛒 la liste</button>
       </div>
       <form class="composer" id="composer">
@@ -79,12 +80,22 @@
           </label>
           <label>Ce qu'on aime<input name="likes" placeholder="pâtes, curry, mexicain, rapide…"></label>
           <label>À éviter (virgules)<input name="avoid" placeholder="champignons, poisson…"></label>
+          <fieldset><legend>Drives à comparer</legend>
+            <div id="stores-box" class="stores-box"></div>
+            <label>Nombre de drives max à faire
+              <select name="maxStores">
+                <option value="1">1 seul drive</option>
+                <option value="2">2 drives si ça vaut le coup</option>
+                <option value="3">Jusqu'à 3 drives</option>
+              </select>
+            </label>
+          </fieldset>
           <label>Mon numéro WhatsApp (optionnel)<input name="phone" inputmode="tel" placeholder="33612345678"></label>
 
           <fieldset class="ai"><legend>Chef IA (Claude)</legend>
-            <p>Sans clé, le chef comprend les commandes simples. Avec une clé API Anthropic, tu lui parles librement et il peut relever les vrais prix sur auchan.fr.</p>
+            <p>Sans clé, le chef comprend les commandes simples et estime les prix. Avec une clé API Anthropic, tu lui parles librement et il peut relever les vrais prix, promos et lots sur les sites des drives.</p>
             <label>Clé API<input name="apiKey" type="password" autocomplete="off" placeholder="sk-ant-…"></label>
-            <label class="inline"><input type="checkbox" name="livePrices"> Chercher les vrais prix sur auchan.fr (plus lent)</label>
+            <label class="inline"><input type="checkbox" name="livePrices"> Chercher les vrais prix et promos sur les drives (plus lent)</label>
             <p class="small">La clé reste dans ce navigateur et n'est envoyée qu'à api.anthropic.com.</p>
           </fieldset>
           <button type="button" class="btn ghost danger" id="reset">Effacer menu & discussion</button>
@@ -103,15 +114,15 @@
 
   <dialog id="order">
     <form method="dialog" class="order">
-      <h2>Commande Auchan</h2>
-      <p>Ouvre chaque produit sur auchan.fr pour l'ajouter au panier, ou envoie la liste sur WhatsApp.</p>
-      <ul id="order-list" class="order-list"></ul>
-      <p class="order-total">Total estimé : <strong id="order-total"></strong></p>
-      <p class="small">🔌 Prochaine étape : un agent connecté à ton compte Auchan qui remplit le panier tout seul après ta validation.</p>
+      <h2>Remplir les paniers</h2>
+      <p>Un panier par drive, au meilleur prix. Ouvre chaque produit sur le site du drive pour l'ajouter, puis valide le créneau de retrait.</p>
+      <div id="order-list" class="order-list"></div>
+      <p class="order-total">Total : <strong id="order-total"></strong></p>
+      <p class="small">🔌 Prochaine étape : un agent connecté à tes comptes drive qui remplit les paniers tout seul ; tu n'as plus qu'à valider le créneau.</p>
       <div class="order-actions">
         <button type="button" class="btn ghost" id="order-copy">Copier</button>
         <button type="button" class="btn ghost" id="order-wa">WhatsApp</button>
-        <button type="button" class="btn primary" id="order-done">Panier rempli ✓</button>
+        <button type="button" class="btn primary" id="order-done">Tout est prêt 🚗</button>
       </div>
       <button class="close" aria-label="Fermer">✕</button>
     </form>

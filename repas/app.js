@@ -1,4 +1,5 @@
 import { CATALOG, RECIPES } from "./recipes.js";
+import { STORES, storeById } from "./stores.js";
 
 const DAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"];
 const SDK_URL = "https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.132.1/+esm";
@@ -12,11 +13,13 @@ const defaultState = () => ({
   profile: {
     people: 2, budget: 70, slots: ["soir"], diet: "omnivore", maxTime: 45,
     likes: "", avoid: [], phone: "", apiKey: "", livePrices: false,
+    stores: STORES.map((s) => s.id), maxStores: 2, forcedStore: "",
   },
   plan: null,          // { days: [{ day, people, meals: [{ slot, recipeId, name, emoji, time, ingredients: [{name, qty, unit}] }] }] }
-  aiShopping: null,    // liste renvoyée par l'IA (prix trouvés sur auchan.fr)
+  aiShopping: null,    // offres par drive renvoyées par l'IA (prix, promos, lots)
   checked: {},
   status: "draft",     // draft | validated | ordered
+  filled: {},          // drives dont le panier a été rempli
   chat: [],
 });
 
@@ -34,6 +37,7 @@ function load() {
 }
 
 function save() {
+  if (state.status === "draft") state.filled = {};
   try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch { /* ignoré */ }
 }
 
@@ -147,7 +151,7 @@ function setPeople(dayObj, people) {
 function fitBudget() {
   let swapped = 0;
   const tried = new Set();
-  while (swapped < 10 && shoppingTotal(buildShopping()) > state.profile.budget) {
+  while (swapped < 10 && basket().total > state.profile.budget) {
     const meals = state.plan.days.flatMap((d) => d.meals.map((m, i) => ({ d, m, i })))
       .filter(({ m }) => !tried.has(m.name))
       .map((x) => ({ ...x, cost: x.m.ingredients.reduce((s, ing) => s + (CATALOG[ing.name] ? unitPrice(CATALOG[ing.name], ing.qty) : 0), 0) / x.d.people }));
@@ -168,6 +172,66 @@ function fitBudget() {
 
 /* ---------- Liste de courses ---------- */
 
+const enabledStores = () => STORES.filter((s) => state.profile.stores.includes(s.id));
+
+// Offres de chaque drive pour un besoin : prix relevé par l'IA si dispo, sinon estimation.
+function offersFor(it, ai) {
+  const cat = CATALOG[it.name];
+  return enabledStores().map((s) => {
+    const o = ai?.offers?.find((x) => x.store === s.id);
+    if (o && o.qty > 0) {
+      const packs = Math.max(1, Math.ceil(it.qty / o.qty - 0.05));
+      return { store: s.id, packs, price: o.price * packs, product: o.product, promo: o.promo || "", source: o.source, packLabel: packLabel(o.qty, o.unit) };
+    }
+    if (cat) {
+      const packs = Math.max(1, Math.ceil(it.qty / cat.pack - 0.05));
+      return { store: s.id, packs, price: unitPrice(cat, packs * cat.pack) * s.index, product: "", promo: "", source: "estimation", packLabel: packLabel(cat.pack, cat.unit) };
+    }
+    return null;
+  }).filter(Boolean);
+}
+
+function combos(ids, max) {
+  const out = [];
+  const rec = (start, cur) => {
+    if (cur.length) out.push([...cur]);
+    if (cur.length === max) return;
+    for (let i = start; i < ids.length; i++) rec(i + 1, [...cur, ids[i]]);
+  };
+  rec(0, []);
+  return out;
+}
+
+const cheapest = (offers, ids) => offers.filter((o) => ids.includes(o.store)).sort((a, b) => a.price - b.price)[0];
+
+// Choisit le meilleur panier : 1 drive, ou jusqu'à `maxStores` drives en répartissant les produits.
+function basket() {
+  const items = buildShopping();
+  const active = items.filter((i) => !state.checked[norm(i.name)]);
+  const ids = enabledStores().map((s) => s.id);
+  const costOf = (combo) => active.reduce((sum, i) => sum + (cheapest(i.offers, combo)?.price ?? cheapest(i.offers, ids)?.price ?? 0), 0);
+  const singles = ids.map((id) => ({ id, total: costOf([id]) })).sort((a, b) => a.total - b.total);
+  const { forcedStore, maxStores } = state.profile;
+  const candidates = forcedStore && ids.includes(forcedStore) ? [[forcedStore]] : combos(ids, maxStores);
+  let best = candidates[0] ?? [];
+  let bestTotal = Infinity;
+  for (const c of candidates) {
+    // Un 2e drive ne vaut le déplacement que s'il fait gagner au moins 3 €.
+    const t = costOf(c) + (c.length - 1) * 3;
+    if (t < bestTotal) { bestTotal = t; best = c; }
+  }
+  for (const i of items) i.choice = cheapest(i.offers, best) ?? cheapest(i.offers, ids) ?? null;
+  const byStore = best.map((id) => {
+    const its = active.filter((i) => i.choice?.store === id);
+    return { id, items: its, total: its.reduce((s, i) => s + i.choice.price, 0) };
+  }).filter((g) => g.items.length);
+  const total = active.reduce((s, i) => s + (i.choice?.price ?? 0), 0);
+  const promos = active.filter((i) => i.choice?.promo).length;
+  // Économie : vs le meilleur drive unique si on en fait plusieurs, sinon vs le plus cher.
+  const ref = byStore.length > 1 ? singles[0] : singles.at(-1);
+  return { items, byStore, total, singles, promos, ref: ref?.id, saving: (ref?.total ?? total) - total };
+}
+
 function buildShopping() {
   if (!state.plan) return [];
   const aiIndex = new Map((state.aiShopping ?? []).map((s) => [norm(s.name), s]));
@@ -184,26 +248,20 @@ function buildShopping() {
   }
   const list = [];
   for (const it of totals.values()) {
-    const cat = CATALOG[it.name];
     const ai = aiIndex.get(norm(it.name));
-    if (ai && ai.qty > 0) {
-      // Prix trouvé par l'IA : on le ramène à la quantité réelle, par paquets entiers.
-      const packs = Math.max(1, Math.ceil(it.qty / ai.qty - 0.05));
-      list.push({ ...it, rayon: ai.rayon, product: ai.product, source: ai.source, packs, packLabel: packLabel(ai.qty, ai.unit), price: ai.price * packs });
-    } else if (cat) {
-      const packs = Math.max(1, Math.ceil(it.qty / cat.pack - 0.05));
-      list.push({ ...it, rayon: cat.rayon, product: "", source: "estimation", packs, packLabel: packLabel(cat.pack, cat.unit), price: unitPrice(cat, packs * cat.pack) });
-    } else {
-      list.push({ ...it, rayon: "Divers", product: "", source: "estimation", packs: 1, packLabel: "", price: 0 });
-    }
+    list.push({ ...it, rayon: ai?.rayon ?? CATALOG[it.name]?.rayon ?? "Divers", offers: offersFor(it, ai) });
   }
   const order = ["Fruits & légumes", "Boucherie", "Poissonnerie", "Frais", "Boulangerie", "Épicerie", "Divers"];
   list.sort((a, b) => (order.indexOf(a.rayon) + 99) % 99 - (order.indexOf(b.rayon) + 99) % 99 || a.name.localeCompare(b.name, "fr"));
   return list;
 }
 
-const shoppingTotal = (list) => list.reduce((s, i) => s + i.price, 0);
-const auchanSearch = (name) => `https://www.auchan.fr/recherche?text=${encodeURIComponent(name)}`;
+function basketLine(b) {
+  if (!b.byStore.length) return "";
+  const parts = b.byStore.map((g) => `${storeById(g.id).short} ${euro(g.total)}`).join(" + ");
+  const saving = b.saving;
+  return `${parts}${saving > 0.5 ? ` — *${euro(saving)}* d'économie vs ${storeById(b.ref).short}` : ""}`;
+}
 
 /* ---------- Interprétation des messages (mode local) ---------- */
 
@@ -251,16 +309,18 @@ function localHandle(text) {
 
   if (/\b(valide|c'?est bon|go|parfait|ca marche)\b/.test(t) && !/\b(change|remplace)\b/.test(t)) {
     state.status = "validated";
-    return `✅ Liste validée ! *${euro(shoppingTotal(buildShopping()))}*.\nAppuie sur *Commander chez Auchan* pour remplir le panier.`;
+    const b = basket();
+    return `✅ Liste validée ! *${euro(b.total)}*\n${basketLine(b)}\nAppuie sur *Remplir les paniers* pour préparer les drives.`;
   }
 
+  let infoNotes = 0;
   const clauses = t.split(/[,;.!?\n]|\bet\b|\bpuis\b|\baussi\b/).map((c) => c.trim()).filter(Boolean);
   for (const c of clauses) {
     const days = daysIn(c);
     const slot = slotIn(c);
 
     const avoid = c.match(/\b(?:pas de|sans|plus de|j'?aime pas (?:les?|la)?|je deteste (?:les?|la)?)\s*([a-z ]{3,25})/);
-    if (avoid && !/\b(on sera|personnes?)\b/.test(c)) {
+    if (avoid && !storeIn(c) && !/\b(on sera|personnes?)\b/.test(c)) {
       const term = avoid[1].trim().replace(/^(les?|la|du|des)\s+/, "").split(/\s+/)[0].replace(/s$/, "");
       if (!state.profile.avoid.includes(term)) state.profile.avoid.push(term);
       let swapped = 0;
@@ -305,22 +365,57 @@ function localHandle(text) {
       continue;
     }
 
+    const store = storeIn(c);
+    if (store && /\b(que|seulement|uniquement|juste|tout chez|prefere|plutot)\b/.test(c)) {
+      state.profile.forcedStore = store.id;
+      if (!state.profile.stores.includes(store.id)) state.profile.stores.push(store.id);
+      notes.push(`${store.emoji} OK, tout chez *${store.name}*.`);
+      continue;
+    }
+    if (store && /\b(pas|sans|evite|jamais)\b/.test(c)) {
+      state.profile.stores = state.profile.stores.filter((id) => id !== store.id);
+      if (state.profile.forcedStore === store.id) state.profile.forcedStore = "";
+      notes.push(`🚫 Plus de *${store.short}*.`);
+      continue;
+    }
+    if (/\b(meilleur prix|moins cher|tous les drives|n'?importe quel drive|optimise)\b/.test(c)) {
+      state.profile.forcedStore = "";
+      notes.push(compareMessage());
+      infoNotes++;
+      continue;
+    }
+    const nDrives = c.match(/\b(\d|un|une|deux)\s+(drives?|magasins?)\b/);
+    if (nDrives) {
+      state.profile.maxStores = Math.min(3, NUMBER_WORDS[nDrives[1]] ?? +nDrives[1]);
+      state.profile.forcedStore = "";
+      notes.push(`🚗 Max *${state.profile.maxStores}* drive${state.profile.maxStores > 1 ? "s" : ""} à faire.`);
+      continue;
+    }
+    if (/\b(compare|comparatif|prix des drives|promos?)\b/.test(c)) {
+      notes.push(compareMessage());
+      infoNotes++;
+      continue;
+    }
+
     if (/\b(liste|courses)\b/.test(c)) {
       notes.push(shoppingMessage());
+      infoNotes++;
       continue;
     }
     if (/\b(menu|semaine|recap)\b/.test(c)) {
       notes.push(weekSummary("Ton menu 👇"));
+      infoNotes++;
       continue;
     }
   }
 
   if (!notes.length) {
-    return "Je n'ai pas tout compris 🤔 Essaie par exemple :\n• _change mardi_\n• _on sera 4 jeudi_\n• _pas de poisson_\n• _mets des tacos vendredi_\n• _budget 60_\n\n💡 Ajoute une clé API Claude dans *Profil* pour me parler librement.";
+    return "Je n'ai pas tout compris 🤔 Essaie par exemple :\n• _change mardi_\n• _on sera 4 jeudi_\n• _pas de poisson_\n• _mets des tacos vendredi_\n• _budget 60_\n• _compare les drives_\n• _que chez Leclerc_ / _2 drives max_\n\n💡 Ajoute une clé API Claude dans *Profil* pour me parler librement.";
   }
+  if (infoNotes === notes.length) return notes.join("\n\n");
   if (state.status !== "draft") state.status = "draft";
-  const total = shoppingTotal(buildShopping());
-  notes.push(`🛒 Nouveau total : *${euro(total)}*${total > state.profile.budget ? ` ⚠️ (budget ${euro(state.profile.budget)})` : ""}`);
+  const b = basket();
+  notes.push(`🛒 Nouveau total : *${euro(b.total)}*${b.total > state.profile.budget ? ` ⚠️ (budget ${euro(state.profile.budget)})` : ""}\n${basketLine(b)}`);
   return notes.join("\n");
 }
 
@@ -330,22 +425,40 @@ function weekSummary(title) {
     lines.push(`*${cap(d.day)}*${d.people !== state.profile.people ? ` (${d.people} pers.)` : ""}`);
     for (const m of d.meals) lines.push(`${m.emoji} ${state.profile.slots.length > 1 ? cap(m.slot) + " : " : ""}${m.name}`);
   }
-  const total = shoppingTotal(buildShopping());
-  lines.push("", `🛒 Courses : *${euro(total)}* pour ${state.profile.budget ? `un budget de ${euro(state.profile.budget)}` : "la semaine"}`);
+  const b = basket();
+  lines.push("", `🛒 Courses : *${euro(b.total)}* pour ${state.profile.budget ? `un budget de ${euro(state.profile.budget)}` : "la semaine"}`, basketLine(b));
   lines.push("Dis-moi ce qui ne te plaît pas, ou réponds *valide* 👌");
   return lines.join("\n");
 }
 
 function shoppingMessage() {
-  const list = buildShopping();
+  const b = basket();
   const lines = ["🛒 *Liste de courses*"];
-  let rayon = "";
-  for (const i of list) {
-    if (i.rayon !== rayon) { rayon = i.rayon; lines.push("", `_${rayon}_`); }
-    lines.push(`• ${i.name} — ${formatQty(i.qty, i.unit)}${i.price ? ` (${euro(i.price)})` : ""}`);
+  for (const g of b.byStore) {
+    const s = storeById(g.id);
+    lines.push("", `${s.emoji} *${s.name}* — ${euro(g.total)}`);
+    for (const i of g.items) {
+      lines.push(`• ${i.name} — ${i.choice.packs} × ${i.choice.product || i.choice.packLabel || formatQty(i.qty, i.unit)} (${euro(i.choice.price)})${i.choice.promo ? ` 🏷️ ${i.choice.promo}` : ""}`);
+    }
   }
-  lines.push("", `Total : *${euro(shoppingTotal(list))}*`);
+  lines.push("", `Total : *${euro(b.total)}*`);
+  if (b.saving > 0.5) lines.push(`💸 ${euro(b.saving)} d'économie vs tout chez ${storeById(b.ref).short}`);
   return lines.join("\n");
+}
+
+function compareMessage() {
+  const b = basket();
+  const lines = ["📊 *Comparatif des drives* (panier complet)"];
+  for (const s of b.singles) lines.push(`${storeById(s.id).emoji} ${storeById(s.id).short} : ${euro(s.total)}`);
+  lines.push("", `✅ Meilleur choix : ${basketLine(b)}`);
+  if (b.promos) lines.push(`🏷️ ${b.promos} produit${b.promos > 1 ? "s" : ""} en promo ou en lot`);
+  return lines.join("\n");
+}
+
+function storeIn(str) {
+  return STORES.find((s) => (s.id === "u"
+    ? /\b(super ?u|systeme ?u|courses ?u|hyper ?u|magasins? u|chez u)\b/.test(str)
+    : new RegExp(`\\b${norm(s.short)}\\b`).test(str)));
 }
 
 /* ---------- Mode IA (Claude) ---------- */
@@ -357,11 +470,13 @@ const ING_SCHEMA = {
 
 const AI_SCHEMA = {
   type: "object", additionalProperties: false,
-  required: ["reply", "budget", "avoidAdd", "plan", "shopping"],
+  required: ["reply", "budget", "avoidAdd", "forcedStore", "maxStores", "plan", "shopping"],
   properties: {
     reply: { type: "string", description: "Réponse courte façon WhatsApp, en français, formatage *gras* et _italique_ autorisé." },
     budget: { type: "number", description: "Budget hebdo en euros (inchangé sauf demande)." },
     avoidAdd: { type: "array", items: { type: "string" }, description: "Nouveaux ingrédients/aliments à exclure désormais." },
+    forcedStore: { type: "string", enum: ["", ...STORES.map((s) => s.id)], description: "Drive imposé par l'utilisateur, vide = meilleur prix (inchangé sauf demande)." },
+    maxStores: { type: "integer", description: "Nombre max de drives à faire, 1 à 3 (inchangé sauf demande)." },
     plan: {
       type: "array", description: "Les 7 jours, lundi → dimanche.",
       items: {
@@ -384,17 +499,27 @@ const AI_SCHEMA = {
       },
     },
     shopping: {
-      type: "array", description: "Un produit Auchan par ingrédient de la semaine (même nom que dans les recettes).",
+      type: "array", description: "Une ligne par ingrédient de la semaine (même nom que dans les recettes), avec les offres de chaque drive.",
       items: {
-        type: "object", additionalProperties: false, required: ["name", "qty", "unit", "rayon", "price", "product", "source"],
+        type: "object", additionalProperties: false, required: ["name", "rayon", "offers"],
         properties: {
           name: { type: "string" },
-          qty: { type: "number", description: "Contenance d'UN paquet du produit." },
-          unit: { type: "string", enum: ["g", "ml", "pièce"] },
           rayon: { type: "string", enum: ["Fruits & légumes", "Boucherie", "Poissonnerie", "Frais", "Boulangerie", "Épicerie", "Divers"] },
-          price: { type: "number", description: "Prix d'UN paquet en euros." },
-          product: { type: "string", description: "Nom du produit Auchan, ex. 'Auchan Pâtes penne 500g'." },
-          source: { type: "string", enum: ["auchan.fr", "estimation"] },
+          offers: {
+            type: "array", description: "Meilleure offre de chaque drive pour cet ingrédient (une par drive au plus).",
+            items: {
+              type: "object", additionalProperties: false, required: ["store", "qty", "unit", "price", "product", "promo", "source"],
+              properties: {
+                store: { type: "string", enum: STORES.map((s) => s.id) },
+                qty: { type: "number", description: "Contenance d'UN article (ou d'un lot entier)." },
+                unit: { type: "string", enum: ["g", "ml", "pièce"] },
+                price: { type: "number", description: "Prix payé pour UN article/lot en euros, promo immédiate déduite." },
+                product: { type: "string", description: "Nom exact du produit, ex. 'Panzani Penne 500g' ou 'Lot 3x Lait demi-écrémé 1L'." },
+                promo: { type: "string", description: "Promo ou lot en cours, ex. '2e à -50%', '3 pour 2', '-30% carte fidélité'. Vide si aucune." },
+                source: { type: "string", enum: ["site", "estimation"] },
+              },
+            },
+          },
         },
       },
     },
@@ -402,16 +527,20 @@ const AI_SCHEMA = {
 };
 
 function systemPrompt() {
+  const stores = enabledStores();
   return `Tu es "Chef", l'assistant repas d'un foyer français, qui discute comme sur WhatsApp.
-Ton job : composer les repas de la semaine, ajuster selon les messages ("change mardi", "on sera 4 jeudi", "pas de poisson"), et tenir la liste de courses Auchan à jour.
+Ton job : composer les repas de la semaine, ajuster selon les messages ("change mardi", "on sera 4 jeudi", "pas de poisson"), et trouver les courses au meilleur prix entre les drives.
+Drives comparés : ${stores.map((s) => `${s.name} (store="${s.id}", ${s.domain})`).join(", ")}.
 Règles :
 - Respecte le régime, les exclusions, le temps de préparation max et vise le budget hebdo de la liste de courses.
 - Ne modifie que ce qui est demandé ; garde le reste du planning identique.
 - Les quantités d'ingrédients d'un repas sont totales pour le nombre de personnes du jour.
-- Dans "shopping", une ligne par ingrédient utilisé dans la semaine, avec un paquet réaliste vendu chez Auchan et son prix.
-${state.profile.livePrices ? "- Utilise la recherche web sur auchan.fr pour trouver les vrais prix des produits principaux ; mets source=\"auchan.fr\" quand le prix vient d'une page Auchan, \"estimation\" sinon." : "- Les prix sont des estimations réalistes des prix Auchan (source=\"estimation\")."}
-- "reply" : 1 à 6 lignes, chaleureux, emojis bienvenus, termine par le total des courses.`;
+- Dans "shopping", une ligne par ingrédient utilisé dans la semaine et, pour chaque drive, le produit le plus avantageux : marque distributeur, promo, lot ou grand format si la quantité est utile. Le prix est celui réellement payé (promo immédiate déduite) ; précise dans "promo" si elle exige la carte fidélité.
+${state.profile.livePrices ? "- Utilise la recherche web sur les sites des drives pour relever les vrais prix et les promos en cours, en priorité sur les produits les plus chers (viande, poisson, fromage). source=\"site\" pour un prix lu sur le site du drive, \"estimation\" sinon. N'invente jamais une promo." : "- Sans recherche web, donne des prix estimés réalistes (source=\"estimation\") et laisse \"promo\" vide."}
+- L'application calcule elle-même le panier optimal (un ou plusieurs drives) à partir de tes offres.
+- "reply" : 1 à 6 lignes, chaleureux, emojis bienvenus.`;
 }
+
 
 function userPrompt(text) {
   const p = state.profile;
@@ -428,6 +557,8 @@ function userPrompt(text) {
 - Temps max : ${p.maxTime} min
 - Goûts : ${p.likes || "—"}
 - À éviter : ${p.avoid.join(", ") || "—"}
+- Drive imposé : ${p.forcedStore || "aucun (meilleur prix)"}
+- Drives max à faire : ${p.maxStores}
 
 ## Planning actuel
 ${compactPlan ? JSON.stringify(compactPlan) : "Aucun : génère une semaine complète."}
@@ -456,7 +587,7 @@ async function callClaude(text) {
     messages,
   };
   if (state.profile.livePrices) {
-    params.tools = [{ type: "web_search_20260209", name: "web_search", max_uses: 10, allowed_domains: ["auchan.fr"] }];
+    params.tools = [{ type: "web_search_20260209", name: "web_search", max_uses: 25, allowed_domains: enabledStores().map((s) => s.domain) }];
   }
 
   let msg;
@@ -478,8 +609,11 @@ async function callClaude(text) {
   state.aiShopping = data.shopping;
   state.profile.budget = data.budget || state.profile.budget;
   for (const a of data.avoidAdd) if (!state.profile.avoid.includes(a)) state.profile.avoid.push(a);
+  state.profile.forcedStore = data.forcedStore;
+  state.profile.maxStores = Math.max(1, Math.min(3, data.maxStores || state.profile.maxStores));
   state.status = /\bvalid/.test(norm(text)) ? "validated" : "draft";
-  return data.reply;
+  const b = basket();
+  return `${data.reply}\n\n🛒 *${euro(b.total)}* — ${basketLine(b)}`;
 }
 
 /* ---------- Conversation ---------- */
@@ -569,46 +703,83 @@ function renderWeek() {
 
 function renderShopping() {
   const el = $("#shopping");
-  const list = buildShopping();
-  if (!list.length) {
+  if (!state.plan) {
     el.innerHTML = `<div class="empty"><p>La liste apparaîtra avec ton menu.</p></div>`;
     return;
   }
-  let rayon = "";
-  let html = "";
-  for (const i of list) {
-    if (i.rayon !== rayon) {
-      if (rayon) html += "</ul>";
-      rayon = i.rayon;
-      html += `<h3 class="rayon">${rayon}</h3><ul class="items">`;
-    }
-    const key = norm(i.name);
-    html += `<li class="${state.checked[key] ? "done" : ""}">
-      <label><input type="checkbox" data-check="${escapeHtml(key)}" ${state.checked[key] ? "checked" : ""}>
-        <span class="item-name">${escapeHtml(i.name)}<small>${formatQty(i.qty, i.unit)}${i.product || i.packLabel ? ` · ${i.packs} × ${escapeHtml(i.product || i.packLabel)}` : ""}</small></span>
-      </label>
-      <span class="price">${i.price ? euro(i.price) : "—"}${i.source === "auchan.fr" ? '<em class="src">auchan.fr</em>' : ""}</span>
-    </li>`;
+  const b = basket();
+  const chosen = new Set(b.byStore.map((g) => g.id));
+  const best = b.singles[0]?.total ?? 0;
+  let html = `<section class="compare" aria-label="Comparatif des drives">
+    <div class="compare-head"><strong>Comparatif des drives</strong><small>panier complet chez un seul drive</small></div>
+    <ul class="drives">${b.singles.map((x) => {
+      const st = storeById(x.id);
+      const pct = best ? Math.round((x.total / best - 1) * 100) : 0;
+      return `<li class="${chosen.has(x.id) ? "on" : ""}">
+        <button data-force="${x.id}" title="Tout prendre chez ${st.name}" aria-pressed="${state.profile.forcedStore === x.id}">
+          <span>${st.emoji} ${st.short}</span><span>${euro(x.total)}${pct > 0 ? ` <small>+${pct}%</small>` : ""}</span>
+        </button></li>`;
+    }).join("")}</ul>
+    <div class="best">
+      <div>✅ <strong>${state.profile.forcedStore ? "Drive choisi" : "Panier optimal"}</strong> : ${b.byStore.map((g) => `${storeById(g.id).short} ${euro(g.total)}`).join(" + ")}</div>
+      ${b.saving > 0.5 ? `<div class="saving">💸 ${euro(b.saving)} d'économie vs tout chez ${storeById(b.ref).short}${b.promos ? ` · 🏷️ ${b.promos} promo${b.promos > 1 ? "s" : ""}/lot${b.promos > 1 ? "s" : ""}` : ""}</div>` : ""}
+      ${state.profile.forcedStore ? `<button class="btn ghost small-btn" data-force="">Revenir au meilleur prix</button>` : ""}
+    </div>
+  </section>`;
+
+  for (const g of b.byStore) {
+    const st = storeById(g.id);
+    html += `<h3 class="store-head"><span>${st.emoji} ${st.name}</span><span>${euro(g.total)}</span></h3><ul class="items">`;
+    for (const i of g.items) html += itemRow(i);
+    html += "</ul>";
   }
-  el.innerHTML = html + "</ul>" +
-    `<p class="note">${state.aiShopping?.some((s) => s.source === "auchan.fr") ? "Prix relevés sur auchan.fr par l'IA ; les autres sont estimés." : "Prix estimés d'après les tarifs Auchan habituels. Active « vrais prix » dans Profil pour les relever en ligne."}</p>`;
+  const home = b.items.filter((i) => state.checked[norm(i.name)]);
+  if (home.length) {
+    html += `<h3 class="store-head"><span>🏠 Déjà à la maison</span><span></span></h3><ul class="items">${home.map(itemRow).join("")}</ul>`;
+  }
+  const live = state.aiShopping?.some((x) => x.offers?.some((o) => o.source === "site"));
+  html += `<p class="note">${live
+    ? "Prix et promos relevés sur les sites des drives par l'IA ; les lignes « estimé » sont des estimations."
+    : "Prix estimés (niveau de prix moyen de chaque enseigne). Ajoute ta clé Claude et active « vrais prix » dans Profil pour relever les prix, promos et lots en ligne."}
+    Coche ce que tu as déjà : c'est retiré des paniers.</p>`;
+  el.innerHTML = html;
+}
+
+function itemRow(i) {
+  const key = norm(i.name);
+  const c = i.choice;
+  const others = i.offers.filter((o) => o !== c).sort((a, b) => a.price - b.price).slice(0, 2)
+    .map((o) => `${storeById(o.store).short} ${euro(o.price)}`).join(" · ");
+  return `<li class="${state.checked[key] ? "done" : ""}">
+    <label><input type="checkbox" data-check="${escapeHtml(key)}" ${state.checked[key] ? "checked" : ""} aria-label="Déjà à la maison : ${escapeHtml(i.name)}">
+      <span class="item-name">${escapeHtml(i.name)}${c?.promo ? ` <span class="promo">🏷️ ${escapeHtml(c.promo)}</span>` : ""}
+        <small>${formatQty(i.qty, i.unit)}${c && (c.product || c.packLabel) ? ` · ${c.packs} × ${escapeHtml(c.product || c.packLabel)}` : ""}</small>
+        ${others ? `<small class="others">ailleurs : ${others}</small>` : ""}
+      </span>
+    </label>
+    <span class="price">${c ? euro(c.price) : "—"}<em class="src">${c?.source === "site" ? "prix site" : "estimé"}</em></span>
+  </li>`;
 }
 
 function renderBar() {
-  const list = buildShopping();
-  const total = shoppingTotal(list);
+  const b = basket();
+  const total = b.total;
   const { budget } = state.profile;
   const pct = budget ? Math.min(100, (total / budget) * 100) : 0;
   $("#total").textContent = euro(total);
-  $("#budget").textContent = `/ ${euro(budget)}`;
+  $("#budget").textContent = `/ ${euro(budget)}${b.byStore.length ? " · " + b.byStore.map((g) => storeById(g.id).short).join(" + ") : ""}`;
   const meter = $("#meter > span");
   meter.style.width = pct + "%";
   meter.classList.toggle("over", total > budget);
   const btn = $("#validate");
   btn.disabled = !state.plan;
-  btn.textContent = state.status === "draft" ? "Valider la liste" : "Commander chez Auchan";
+  btn.textContent = { draft: "Valider la liste", validated: "Remplir les paniers", ordered: "Paniers prêts 🚗" }[state.status];
   btn.classList.toggle("go", state.status !== "draft");
-  $("#state-pill").textContent = { draft: "Brouillon", validated: "Validée ✓", ordered: "Panier envoyé 🛒" }[state.status];
+  $("#state-pill").textContent = { draft: "Brouillon", validated: "Validée ✓", ordered: "À aller chercher 🚗" }[state.status];
+}
+
+function renderStoreBoxes() {
+  $("#stores-box").innerHTML = STORES.map((st) => `<label class="inline"><input type="checkbox" name="stores" value="${st.id}"> ${st.emoji} ${st.name}</label>`).join("");
 }
 
 function renderProfile() {
@@ -623,6 +794,8 @@ function renderProfile() {
   f.phone.value = p.phone;
   f.apiKey.value = p.apiKey;
   f.livePrices.checked = p.livePrices;
+  f.maxStores.value = p.maxStores;
+  f.querySelectorAll('input[name="stores"]').forEach((c) => { c.checked = p.stores.includes(c.value); });
   f.querySelectorAll('input[name="slots"]').forEach((c) => { c.checked = p.slots.includes(c.value); });
   $("#mode").textContent = p.apiKey ? "IA Claude" : "mode local";
 }
@@ -647,12 +820,20 @@ function exportText() {
 }
 
 function openOrder() {
-  const list = buildShopping().filter((i) => !state.checked[norm(i.name)]);
-  $("#order-list").innerHTML = list.map((i) => `
-    <li><a href="${auchanSearch(i.product || i.name)}" target="_blank" rel="noopener">
-      <span>${escapeHtml(i.name)} <small>× ${i.packs}</small></span><span>${i.price ? euro(i.price) : ""} ↗</span></a></li>`).join("");
-  $("#order-total").textContent = euro(shoppingTotal(list));
-  $("#order").showModal();
+  const b = basket();
+    $("#order-list").innerHTML = b.byStore.map((g) => {
+    const st = storeById(g.id);
+    return `<section class="order-store ${state.filled[g.id] ? "filled" : ""}">
+      <header><strong>${st.emoji} ${st.name}</strong><span>${euro(g.total)}</span></header>
+      <ul>${g.items.map((i) => `<li><a href="${st.search(i.choice.product || i.name)}" target="_blank" rel="noopener">
+        <span>${escapeHtml(i.choice.product || i.name)} <small>× ${i.choice.packs}</small>${i.choice.promo ? ` <span class="promo">🏷️ ${escapeHtml(i.choice.promo)}</span>` : ""}</span>
+        <span>${euro(i.choice.price)} ↗</span></a></li>`).join("")}</ul>
+      <button type="button" class="btn ${state.filled[g.id] ? "ghost" : "primary"}" data-filled="${g.id}">${state.filled[g.id] ? "Panier rempli ✓" : `J'ai rempli le panier ${st.short}`}</button>
+    </section>`;
+  }).join("");
+  $("#order-total").textContent = euro(b.total);
+  $("#order-done").disabled = !b.byStore.every((g) => state.filled[g.id]);
+  if (!$("#order").open) $("#order").showModal();
 }
 
 /* ---------- Événements ---------- */
@@ -683,6 +864,17 @@ function bind() {
       const d = state.plan.days.find((x) => x.day === t.dataset.people);
       const n = Math.max(1, Math.min(12, d.people + +t.dataset.delta));
       if (n !== d.people) { setPeople(d, n); state.status = "draft"; save(); renderAll(); }
+      return;
+    }
+    if (t.dataset.force !== undefined) {
+      state.profile.forcedStore = t.dataset.force === state.profile.forcedStore ? "" : t.dataset.force;
+      state.status = "draft";
+      save(); renderAll();
+      return;
+    }
+    if (t.dataset.filled) {
+      state.filled[t.dataset.filled] = true;
+      save(); openOrder();
     }
   });
 
@@ -697,7 +889,8 @@ function bind() {
     if (state.status === "draft") {
       state.status = "validated";
       pushMsg("me", "Je valide ✅");
-      pushMsg("bot", `Top ! Liste validée : *${euro(shoppingTotal(buildShopping()))}*.\nJ'ouvre la commande Auchan 🛒`);
+      const b = basket();
+      pushMsg("bot", `Top ! Liste validée : *${euro(b.total)}*\n${basketLine(b)}\nJe prépare les paniers 🛒`);
       save(); renderAll();
     }
     openOrder();
@@ -712,7 +905,8 @@ function bind() {
   });
   $("#order-done").addEventListener("click", () => {
     state.status = "ordered";
-    pushMsg("bot", "🛒 Panier Auchan rempli. Bon appétit cette semaine ! Dis *nouvelle semaine* quand tu veux recommencer.");
+    const b = basket();
+    pushMsg("bot", `🚗 Paniers prêts : ${b.byStore.map((g) => `${storeById(g.id).name} (${euro(g.total)})`).join(" + ")}.\nTu n'as plus qu'à valider le créneau de retrait et aller chercher. Bon appétit ! Dis *nouvelle semaine* quand tu veux recommencer.`);
     save(); renderAll();
     $("#order").close();
   });
@@ -735,6 +929,10 @@ function bind() {
     p.phone = f.phone.value;
     p.apiKey = f.apiKey.value.trim();
     p.livePrices = f.livePrices.checked;
+    const stores = [...f.querySelectorAll('input[name="stores"]:checked')].map((c) => c.value);
+    p.stores = stores.length ? stores : [STORES[0].id];
+    if (!p.stores.includes(p.forcedStore)) p.forcedStore = "";
+    p.maxStores = +f.maxStores.value;
     const slots = [...f.querySelectorAll('input[name="slots"]:checked')].map((c) => c.value);
     p.slots = slots.length ? slots : ["soir"];
     if (state.plan && p.people !== oldPeople) {
@@ -759,9 +957,10 @@ function showView(view) {
 
 function greet() {
   if (state.chat.length) return;
-  pushMsg("bot", "Salut 👋 Je suis ton *Chef perso*.\nJe prépare tes repas de la semaine, je fais la liste de courses avec les prix Auchan, et tu me dis ce qui ne te va pas.\n\nRéponds *go* ou appuie sur _Préparer ma semaine_ pour commencer !");
+  pushMsg("bot", "Salut 👋 Je suis ton *Chef perso*.\nJe prépare tes repas de la semaine, je cherche les courses au meilleur prix entre les drives (promos, lots), je remplis les paniers… et toi tu valides et tu vas chercher 🚗\n\nRéponds *go* ou appuie sur _Préparer ma semaine_ pour commencer !");
 }
 
+renderStoreBoxes();
 bind();
 renderChat();
 renderAll();
